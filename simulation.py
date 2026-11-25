@@ -1,9 +1,9 @@
 import tkinter as tk
 import torch
-from model import CarState, CarNet # your trained model classes
-from utils import get_inputs, load_checkpoint_tolerant  # function to compute NN inputs and tolerant loader
-from track import Track  # your Track class
-from utils import args_nn  # argument parser for simulation parameters
+from model import CarState, CarNet 
+from utils import get_inputs, load_checkpoint_tolerant
+from track import Track
+from utils import args_nn
 
 # -----------------------------
 # Simulation parameters

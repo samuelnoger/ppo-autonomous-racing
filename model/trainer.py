@@ -1,9 +1,7 @@
 import torch
 import torch.nn as nn
-from tqdm import trange
 
-from model import CarState
-from utils import save_checkpoint, get_inputs, RewardPlotter
+from utils import get_inputs, RewardPlotter
 
 
 class PPOTrainer:
