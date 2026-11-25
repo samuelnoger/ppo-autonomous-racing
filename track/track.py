@@ -143,6 +143,25 @@ class Track:
         self.distance_field = torch.tensor(dist, dtype=torch.float32, device=device)
         # build_distance_field timing print removed
 
+    def resample_centerline(self, centerline, spacing=25.0):
+        """Resample a closed centerline loop to uniform arc-length spacing."""
+        pts = np.asarray(centerline, dtype=np.float32)
+        # Close loop for arc-length calculation
+        if not np.allclose(pts[0], pts[-1]):
+            pts = np.vstack([pts, pts[0]])
+
+        diffs = np.diff(pts, axis=0)
+        seg_lens = np.linalg.norm(diffs, axis=1)
+        cum_dist = np.concatenate([[0.0], np.cumsum(seg_lens)])
+        total_len = cum_dist[-1]
+
+        n_samples = max(8, int(round(total_len / spacing)))
+        target_dists = np.linspace(0.0, total_len, n_samples, endpoint=False)
+
+        x_new = np.interp(target_dists, cum_dist, pts[:, 0])
+        y_new = np.interp(target_dists, cum_dist, pts[:, 1])
+        return list(zip(x_new.tolist(), y_new.tolist()))
+
     def _sample_distance_field_bilinear(self, points):
         """Bilinear sample distance field at points of shape (K,2)."""
         x = points[:, 0]
@@ -438,15 +457,12 @@ class Track:
                 if len(track_borders[i]) > 0 and not np.allclose(track_borders[i][0], track_borders[i][-1]):
                     track_borders[i].append(track_borders[i][0])
 
-        centerline = self.compute_centerline(
-            track_borders[0],
-            track_borders[1]
-        )
-
+        centerline = self.compute_centerline(track_borders[0], track_borders[1])
+        centerline = self.resample_centerline(centerline, spacing=25.0)
         gates = self.generate_gates(
             centerline,
             track_width=inner_width + outer_width,
-            gates_per_segment=gates_per_segment
+            gates_per_segment=1,
         )
 
         return track_borders[0], track_borders[1], gates

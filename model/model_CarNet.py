@@ -5,45 +5,56 @@ import time
 
 
 class CarNet(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, n_rays):
+    def __init__(self, input_dim, hidden_dim, output_dim, n_rays, init_log_std=-2.0):
         super().__init__()
         self.n_rays = n_rays
-        state_dim = input_dim - n_rays  # remaining inputs (speed, heading, etc.)
+        state_dim = input_dim - n_rays
 
-        # ---- Ray encoder ----
-        # Treat rays as a 1D signal and pass through a small conv net
         self.ray_net = nn.Sequential(
             nn.Conv1d(1, 8, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Conv1d(8, 16, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Flatten(),  # output shape: [batch, 16 * n_rays]
+            nn.Flatten(),
         )
         ray_out_dim = 16 * n_rays
 
-        # ---- State encoder ----
-        self.state_net = nn.Sequential(nn.Linear(state_dim, hidden_dim // 2), nn.ReLU())
+        self.state_net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim // 2),
+            nn.ReLU(),
+        )
 
-        # ---- Control network ----
-        self.fc = nn.Sequential(
-            nn.Linear(ray_out_dim + hidden_dim // 2, hidden_dim),
+        feat_dim = ray_out_dim + hidden_dim // 2
+
+        # Shared trunk
+        self.trunk = nn.Sequential(
+            nn.Linear(feat_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim),
-            nn.Tanh(),  # outputs steering [-1,1] and acceleration [-1,1]
         )
 
+        # Actor head (mean steering & accel in [-1, 1]) + learnable log_std
+        self.actor_mean = nn.Sequential(
+            nn.Linear(hidden_dim, output_dim),
+            nn.Tanh(),
+        )
+        self.log_std = nn.Parameter(torch.full((output_dim,), init_log_std))
+
+        # Critic head (state value V(s))
+        self.critic = nn.Linear(hidden_dim, 1)
+
     def forward(self, x):
-        # Split rays vs. state features
-        rays = x[:, : self.n_rays].unsqueeze(1)  # (batch, 1, n_rays)
-        state = x[:, self.n_rays :]  # (batch, state_dim)
+        rays = x[:, : self.n_rays].unsqueeze(1)
+        state = x[:, self.n_rays :]
+        h = self.trunk(torch.cat([self.ray_net(rays), self.state_net(state)], dim=1))
+        mean = self.actor_mean(h)
+        value = self.critic(h).squeeze(-1)
+        return mean, value
 
-        r = self.ray_net(rays)
-        s = self.state_net(state)
-
-        combined = torch.cat([r, s], dim=1)
-        return self.fc(combined)
+    def get_dist(self, mean):
+        std = torch.exp(self.log_std.clamp(-3.5, -1.8))
+        return torch.distributions.Normal(mean, std)
 
 class CarState:
     def __init__(self, n_cars, n_rays, device, car_length=8.0, car_width=4.0, start_spacing=1.5):
@@ -90,14 +101,17 @@ class CarState:
         self.max_speed = 80.0
         self.accel_rate = 7.5
         self.breaking_rate = 20.0
-        self.friction = 0.02
-        self.drift_factor = 0.25  # Velocity lag: 0 = instant, 1 = no effect
+        self.friction = 0.025
+        self.drift_factor = 3.0  # Velocity lag: 0 = instant, 1 = no effect
         self.wheelbase = 7.5
         self.max_steering_angle = math.pi / 4
-        self.max_grip_accel = 20.0
+        self.max_grip_accel = 35.0
         self.max_steering_rate = 1.0  
         self.enter_threshold = 1.0
-        self.exit_threshold = 0.05
+        self.exit_threshold = 0.5
+        self.enter_threshold = 1.0
+        self.exit_threshold = 0.5
+        self.wall_drag = 0.75
         # grouping id for batch-local interactions. Default single group 0
         self.batch = torch.zeros(n_cars, dtype=torch.long, device=device)
         # Physical dimensions (pixels)
@@ -116,118 +130,54 @@ class CarState:
         self.prev_rank = torch.zeros(n_cars, dtype=torch.long, device=device)
         # init timing print removed
 
-    def reset(self, track, start_idx, epoch, force_direction=None, start_mode=None, group_size=None):
-        """Reset car positions and velocities for a new episode.
-
-        Args:
-            epoch: Current training epochs
-            track: Track object
-            start_idx: Starting gate index
-        """
+    def reset(self, track, start_idx=None, random_start=True, force_direction=None):
         device = self.pos.device
-        t0 = time.time()
-
-        # Gate center and orientation
-        start_gate = track.gates[start_idx]
-        start_center = torch.tensor(
-            [(start_gate[0] + start_gate[2]) / 2, (start_gate[1] + start_gate[3]) / 2],
-            dtype=torch.float32,
-            device=device,
-        )
-        gate_vec = torch.tensor(
-            [start_gate[2] - start_gate[0], start_gate[3] - start_gate[1]],
-            dtype=torch.float32,
-            device=device,
-        )
-        gate_dir = gate_vec / (gate_vec.norm() + 1e-9)
-        perp_dir = torch.tensor([-gate_dir[1], gate_dir[0]], device=device)
-
-        # choose start mode / group size
-        if start_mode is None:
-            start_mode = getattr(self, 'start_mode', 'random')
-        if group_size is None:
-            group_size = getattr(self, 'group_size', None)
-
         n = self.n_cars
-        idxs = torch.arange(n, device=device)
+        n_gates = track.gates.shape[0]
+        gates = track.gates.to(device)
 
-        # base angle with small per-car jitter
-        base_angle = torch.atan2(gate_vec[1], gate_vec[0]) + math.pi / 2
-        start_angle = torch.full((n,), base_angle, device=device)
-        start_angle += (torch.rand(n, device=device) - 0.5) * 0.25
-
-        # default simple random offsets (fast, on-device)
-        along_offset = (torch.rand(n, device=device) - 0.5) * gate_vec.norm() * 0.2
-        perp_offset = (torch.rand(n, device=device) - 0.5) * 10.0
-        start_pos = start_center.unsqueeze(0) + along_offset.unsqueeze(1) * gate_dir + perp_offset.unsqueeze(1) * perp_dir
-
-        # F1 / grouped starts: vectorized placement into two columns per group
-        if start_mode == 'f1' or (group_size is not None and group_size > 0):
-            if group_size is None or group_size <= 0:
-                group_size = max(4, min(6, n))
-            groups = idxs // group_size
-            self.batch = groups
-
-            # position within group
-            pos_in_group = idxs - groups * group_size
-            col = pos_in_group % 2
-            row_idx = pos_in_group // 2
-
-            # compute rows per group to center the grid
-            counts = torch.bincount(groups, minlength=(groups.max().item() + 1)).to(device=device)
-            n_rows = (counts + 1) // 2
-            n_rows_per = n_rows[groups]
-
-            car_length = self.car_length
-            spacing_long = car_length * max(2.5, self.start_spacing)
-            spacing_lat = self.car_width
-
-            row_offset = (row_idx.to(torch.float32) - (n_rows_per.to(torch.float32) - 1.0) / 2.0) * spacing_long
-            lateral = (-0.5 + col.to(torch.float32)) * spacing_lat
-
-            start_pos = start_center.unsqueeze(0) + row_offset.unsqueeze(1) * perp_dir + lateral.unsqueeze(1) * gate_dir
-
-            # small deterministic angle offset for side-by-side symmetry (safe integer-based)
-            sign = torch.where((pos_in_group % 2) == 0, torch.tensor(1.0, device=device), torch.tensor(-1.0, device=device))
-            start_angle = start_angle + sign * 0.02
-
-        # assign driving directions (half forward, half reverse) vectorized
-        if force_direction is not None:
-            # honor explicit override from caller (e.g., Trainer.collect_rollout)
-            self.direction = torch.full((n,), int(force_direction), dtype=torch.int, device=device)
+        if random_start or start_idx is None:
+            start_indices = torch.randint(0, n_gates, (n,), device=device)
         else:
-            half = n // 2
-            dir_tensor = torch.ones(n, dtype=torch.int, device=device)
-            dir_tensor[half: half * 2] = -1
-            if n % 2 == 1:
-                dir_tensor[-1] = -1 if torch.rand(1, device=device) < 0.5 else 1
-            self.direction = dir_tensor
+            start_indices = torch.full((n,), int(start_idx), dtype=torch.long, device=device)
 
-        # ensure batch id exists for non-grouped starts
-        if not hasattr(self, 'batch') or self.batch.numel() != n:
-            self.batch = torch.zeros(n, dtype=torch.long, device=device)
+        start_gates = gates[start_indices]  # (N, 4)
+        start_centers = (start_gates[:, 0:2] + start_gates[:, 2:4]) / 2.0
+        gate_vecs = start_gates[:, 2:4] - start_gates[:, 0:2]
+        gate_lens = gate_vecs.norm(dim=1, keepdim=True) + 1e-9
+        gate_dirs = gate_vecs / gate_lens
+        perp_dirs = torch.stack([-gate_dirs[:, 1], gate_dirs[:, 0]], dim=1)
 
-        # write positions/angles and standard resets (fast, on-device)
-        self.pos = start_pos
-        self.angle = start_angle + math.pi * (1 - self.direction) / 2
+        # Direction: forward (+1) or reverse (-1)
+        if force_direction is not None:
+            self.direction = torch.full((n,), int(force_direction), dtype=torch.long, device=device)
+        else:
+            self.direction = torch.where(
+                torch.rand(n, device=device) < 0.5,
+                torch.ones(n, dtype=torch.long, device=device),
+                -torch.ones(n, dtype=torch.long, device=device),
+            )
+
+        # Small random lateral/longitudinal/angle jitter
+        along_offset = (torch.rand(n, 1, device=device) - 0.5) * gate_lens * 0.4
+        perp_offset = (torch.rand(n, 1, device=device) - 0.5) * 6.0
+        self.pos = start_centers + along_offset * gate_dirs + perp_offset * perp_dirs
+        self.prev_pos = self.pos.clone()
+
+        base_angle = torch.atan2(gate_vecs[:, 1], gate_vecs[:, 0]) + math.pi / 2
+        angle_offset = (torch.rand(n, device=device) - 0.5) * 0.25
+        self.angle = base_angle + angle_offset + math.pi * (1 - self.direction) / 2
+
+        start_speed = torch.rand(n, device=device) * (self.max_speed * 0.5)
+        self.speed.copy_(start_speed)
+        self.vel = torch.stack([torch.cos(self.angle), torch.sin(self.angle)], dim=1) * start_speed.unsqueeze(1)
+
         self.active.fill_(True)
         self.prev_steer.zero_()
         self.was_slipping.zero_()
+        self.gates_passed.zero_()
 
-        start_speed = 0.0
-        self.speed.fill_(start_speed)
-        self.vel = torch.stack([torch.cos(self.angle), torch.sin(self.angle)], dim=1) * start_speed
-
-        # reset per-step contact bookkeeping and progress/rank
-        try:
-            self.last_impacts.zero_()
-            self.contact_slowdown.fill_(1.0)
-            self.prev_progress.zero_()
-            self.prev_rank.zero_()
-        except Exception:
-            pass
-
-        # reset timing print removed
+        return start_indices
 
     @property
     def ray_angles(self):
@@ -319,7 +269,7 @@ class CarState:
 
         # Speed loss from drifting (lateral friction during oversteer)
         slip_excess = (slip_ratio - 1.0).clamp(min=0.0)
-        drift_friction_factor = 10  # Tunable: higher = more speed loss while drifting
+        drift_friction_factor = 5  # Tunable: higher = more speed loss while drifting
         self.speed[slip_mask] = self.speed[slip_mask] * (1.0 - slip_excess[slip_mask] * drift_friction_factor * dt)
 
         # Recompute ideal velocity with the new (lower) speed from drift friction
@@ -459,55 +409,11 @@ class CarState:
                     if crashed.any():
                         to_crash = idx_mv[crashed]
                         self.active[to_crash] = False
-                    # accumulate impact magnitudes for these indices and set slowdown
                     self.last_impacts[idx_mv] += j_impulse.abs()
-                    try:
-                        speed_scale = torch.clamp(1.0 - (self.last_impacts[idx_mv] / 20.0), min=0.2)
-                        self.contact_slowdown[idx_mv] = speed_scale
-                        self.vel[idx_mv] = self.vel[idx_mv] * speed_scale.unsqueeze(1)
-                    except Exception:
-                        pass
 
-        # --- Car-to-car collisions ---
-        # Resolve collisions only within the same batch/group so cars in different
-        # interaction groups do not collide (supports large total N split into groups).
-        from utils.my_utils import resolve_pairwise_collisions
-        unique_batches = torch.unique(self.batch)
-        for b in unique_batches:
-            mask = (self.batch == b) & self.active
-            idxs = torch.nonzero(mask, as_tuple=False).flatten()
-            if idxs.numel() <= 1:
-                continue
-
-            pos_subset = self.pos[idxs]
-            vel_subset = self.vel[idxs]
-            device = pos_subset.device
-            radii = torch.full((pos_subset.shape[0],), self.car_radius, device=device)
-
-            new_pos, new_vel, impacts = resolve_pairwise_collisions(
-                pos_subset.clone(), vel_subset.clone(), radii=radii, masses=None, restitution=0.25
-            )
-
-            # write back resolved positions/velocities for this group
-            self.pos[idxs] = new_pos
-            self.vel[idxs] = new_vel
-
-            # If impact is large, mark those cars as inactive (they 'crashed')
-            impact_thresh = 5.0
-            crashed = impacts > impact_thresh
-            if crashed.any():
-                to_crash = idxs[crashed]
-                self.active[to_crash] = False
-            # store impact magnitudes for this group's indices and set slowdown
-            try:
-                self.last_impacts[idxs] = impacts
-                speed_scale = torch.clamp(1.0 - (impacts / 20.0), min=0.2)
-                self.contact_slowdown[idxs] = speed_scale
-                # apply immediate speed reduction proportional to impacts
-                self.vel[idxs] = self.vel[idxs] * speed_scale.unsqueeze(1)
-                # keep speed magnitude consistent
-                self.speed[idxs] = torch.norm(self.vel[idxs], dim=1)
-            except Exception:
-                pass
+                # Apply wall drag to ALL penetrating cars (including parallel wall-hugging)
+                self.vel[idx_pen] = self.vel[idx_pen] * self.wall_drag
+                self.speed[idx_pen] = torch.norm(self.vel[idx_pen], dim=1)
+                self.contact_slowdown[idx_pen] = self.wall_drag
 
  

@@ -137,241 +137,41 @@ def generate_simple_track(screen_width=1000, screen_height=600,
 
     return centerline
 
-def get_inputs(cars,track, gates_tensor, gate_indices, max_ray_dist):
-        """Get neural network inputs for all cars.
+def get_inputs(cars, track, gates_tensor, gate_indices, max_ray_dist):
+    ray_angles = cars.ray_angles
+    ray_dists_original = track.get_lines_along_rays(cars.pos, ray_angles, max_ray_dist)
+    ray_dists = ray_dists_original / max_ray_dist
 
-        Computes ray distances, heading error, speed, curvature lookahead, etc.
+    speed_input = cars.speed.unsqueeze(1) / cars.max_speed
 
-        Args:
-            cars: CarState object.
-            gates_tensor: Tensor containing gate coordinates.
-            gate_indices: Current gate indices for all cars.
+    car_heading_x = torch.cos(cars.angle)
+    car_heading_y = torch.sin(cars.angle)
 
-        Returns:
-            inputs: Model input tensor (N, input_dim).
-            ray_dists: Ray distances for reward computation (N, n_rays).
-        """
-        # Compute next gate centers
-        next_gate_centers = (
-            gates_tensor[gate_indices, 0:2] + gates_tensor[gate_indices, 2:4]
-        ) / 2
+    curvatures = []
+    distances = []
+    n_gates = gates_tensor.shape[0]
+    for lookahead in [2, 5, 9]:
+        next_idx = (gate_indices + lookahead * cars.direction) % n_gates
+        next_gate = gates_tensor[next_idx]
 
-        # ---- Ray distances ----
-        ray_angles = cars.ray_angles  # (N, R)
-        # Time the ray intersection call to detect large expansions
-        import time as _time
-        t0 = _time.time()
-        try:
-            # compute shapes for potential debugging (no noisy prints)
-            n_rays = ray_angles.shape[1]
-            n_cars = ray_angles.shape[0]
-            n_lines = getattr(track, 'all_lines', None)
-            n_lines = 0 if n_lines is None else n_lines.shape[0]
-        except Exception:
-            n_rays = n_cars = n_lines = None
-        ray_dists_original = track.get_lines_along_rays(cars.pos, ray_angles, max_ray_dist)  # (N, R)
-        ray_dists = ray_dists_original / max_ray_dist
+        next_center = (next_gate[:, 0:2] + next_gate[:, 2:4]) / 2.0
+        next_dist = (next_center - cars.pos).norm(dim=1)
+        distances.append(torch.clamp(next_dist / max_ray_dist, max=1.0).unsqueeze(1))
 
-        # ---- Heading error to next gate ----
-        #delta = next_gate_centers - cars.pos  # (N, 2)
-        #target_angle = torch.atan2(delta[:, 1], delta[:, 0])
-        #heading_error = target_angle - cars.angle
-        #heading_error = torch.atan2(torch.sin(heading_error), torch.cos(heading_error))
-        #sin_error = torch.sin(heading_error)
-        #cos_error = torch.cos(heading_error)
+        next_gx = next_gate[:, 2] - next_gate[:, 0]
+        next_gy = next_gate[:, 3] - next_gate[:, 1]
+        next_norm = torch.hypot(next_gx, next_gy) + 1e-6
+        next_dir_x = (-next_gy / next_norm) * cars.direction
+        next_dir_y = (next_gx / next_norm) * cars.direction
 
-        # ---- Speed input (normalize) ----
-        speed_input = cars.speed.unsqueeze(1) / 140.0
+        cos_curv = car_heading_x * next_dir_x + car_heading_y * next_dir_y
+        sin_curv = car_heading_x * next_dir_y - car_heading_y * next_dir_x
+        curvatures.append(cos_curv.unsqueeze(1))
+        curvatures.append(sin_curv.unsqueeze(1))
 
-        # ---- Lookahead curvature (gates 1, 2, 3 ahead) ----
-        # Compute car's heading direction
-        car_heading_x = torch.cos(cars.angle)
-        car_heading_y = torch.sin(cars.angle)
-
-        curvatures = []
-        distances = []
-        n_gates = gates_tensor.shape[0]
-        for lookahead in [1, 2, 3]:
-            next_idx = (gate_indices + lookahead * cars.direction) % n_gates
-
-            # Extract gate direction for upcoming gate
-            next_gate = gates_tensor[next_idx]  # (N, 4)
-
-            next_gx = next_gate[:, 2] - next_gate[:, 0]
-            next_gy = next_gate[:, 3] - next_gate[:, 1]
-
-            # Distance from car position to the center of the lookahead gate
-            next_center = (next_gate[:, 0:2] + next_gate[:, 2:4]) / 2
-            next_dist_to_center = (next_center - cars.pos).norm(dim=1)
-
-            # Normalize and clip by max_ray_dist
-            next_dist_norm = torch.clamp(next_dist_to_center / max_ray_dist, max=1.0)
-            distances.append(next_dist_norm.unsqueeze(1))
-
-            next_norm = torch.hypot(next_gx, next_gy)
-            next_dir_x = -next_gy / (next_norm + 1e-6)
-            next_dir_y = next_gx / (next_norm + 1e-6)
-
-            next_dir_x = next_dir_x * cars.direction
-            next_dir_y = next_dir_y * cars.direction
-
-            # Curvature: angle difference between car heading and next gate direction
-            # cos_curv: dot product = cos(angle)
-            # sin_curv: cross product = sin(angle)
-            cos_curv = car_heading_x * next_dir_x + car_heading_y * next_dir_y
-            sin_curv = car_heading_x * next_dir_y - car_heading_y * next_dir_x
-
-            curvatures.append(cos_curv.unsqueeze(1))
-            curvatures.append(sin_curv.unsqueeze(1))
-
-
-        # ---- Nearby cars (relative) ----
-        # Add features describing the K nearest other cars in car-centric coordinates.
-        K = 3
-        device = cars.pos.device
-        N = cars.pos.shape[0]
-        # Respect inactive cars: treat them as not present for neighbor selection
-        active_mask = None
-        if hasattr(cars, 'active'):
-            active_mask = cars.active.to(device)
-
-        # Build neighbor features per-group to avoid global O(N^2) cdist when groups are small
-        neigh_feats = torch.zeros((N, K * 4), device=device)
-        forward_all = torch.stack([torch.cos(cars.angle), torch.sin(cars.angle)], dim=1)  # (N,2)
-        lateral_all = torch.stack([-torch.sin(cars.angle), torch.cos(cars.angle)], dim=1)  # (N,2)
-        pos_all = cars.pos
-        vel_all = cars.vel
-
-        if N > 1:
-            if hasattr(cars, 'batch'):
-                batch = cars.batch.to(device)
-                unique_batches = torch.unique(batch)
-                for b in unique_batches:
-                    idxs = (batch == b).nonzero(as_tuple=True)[0]
-                    g = idxs.numel()
-                    if g <= 1:
-                        continue
-                    pos_g = pos_all[idxs]
-                    vel_g = vel_all[idxs]
-                    fwd_g = forward_all[idxs]
-                    lat_g = lateral_all[idxs]
-
-                    # pairwise relative vectors within group: (g,g,2)
-                    rel = pos_g.unsqueeze(1) - pos_g.unsqueeze(0)
-                    dists = torch.norm(rel, dim=2)
-                    # ignore self
-                    diag = torch.arange(g, device=device)
-                    dists[diag, diag] = 1e6
-
-                    # mask inactive members so they don't appear as neighbors
-                    if active_mask is not None:
-                        active_g = active_mask[idxs]
-                        if active_g.numel() == g:
-                            dists[~active_g, :] = 1e6
-                            dists[:, ~active_g] = 1e6
-
-                    k_use = min(K, g - 1)
-                    if k_use <= 0:
-                        continue
-
-                    # get neighbor indices local to group
-                    _, nbr_idx_local = torch.topk(dists, k=k_use, largest=False)
-                    # pad if fewer than K
-                    if k_use < K:
-                        pad = nbr_idx_local[:, -1:].repeat(1, K - k_use)
-                        nbr_idx_local = torch.cat([nbr_idx_local, pad], dim=1)
-
-                    # gather neighbor positions/velocities: (g, K, 2)
-                    nbr_pos = pos_g[nbr_idx_local]
-                    nbr_vel = vel_g[nbr_idx_local]
-
-                    rel_fg = nbr_pos - pos_g.unsqueeze(1)  # (g,K,2)
-                    fwd_unsq = fwd_g.unsqueeze(1)
-                    lat_unsq = lat_g.unsqueeze(1)
-
-                    rel_f = (rel_fg * fwd_unsq).sum(dim=2)  # (g,K)
-                    rel_l = (rel_fg * lat_unsq).sum(dim=2)  # (g,K)
-                    rel_v = vel_g.unsqueeze(1) - nbr_vel
-                    rel_v_f = (rel_v * fwd_unsq).sum(dim=2)
-
-                    d_norm = torch.clamp(torch.sqrt(rel_f ** 2 + rel_l ** 2) / max_ray_dist, max=1.0)
-                    vf_norm = rel_v_f / 140.0
-
-                    feats = torch.stack([d_norm, rel_f / max_ray_dist, rel_l / max_ray_dist, vf_norm], dim=2)
-                    feats = feats.reshape(g, -1)
-                    neigh_feats[idxs] = feats
-            else:
-                # single group: vectorize over all cars
-                g = N
-                pos_g = pos_all
-                vel_g = vel_all
-                fwd_g = forward_all
-                lat_g = lateral_all
-
-                rel = pos_g.unsqueeze(1) - pos_g.unsqueeze(0)
-                dists = torch.norm(rel, dim=2)
-                diag = torch.arange(g, device=device)
-                dists[diag, diag] = 1e6
-                if active_mask is not None:
-                    dists[~active_mask, :] = 1e6
-                    dists[:, ~active_mask] = 1e6
-
-                k_use = min(K, g - 1)
-                if k_use > 0:
-                    _, nbr_idx_local = torch.topk(dists, k=k_use, largest=False)
-                    if k_use < K:
-                        pad = nbr_idx_local[:, -1:].repeat(1, K - k_use)
-                        nbr_idx_local = torch.cat([nbr_idx_local, pad], dim=1)
-
-                    nbr_pos = pos_g[nbr_idx_local]
-                    nbr_vel = vel_g[nbr_idx_local]
-                    rel_fg = nbr_pos - pos_g.unsqueeze(1)
-                    fwd_unsq = fwd_g.unsqueeze(1)
-                    lat_unsq = lat_g.unsqueeze(1)
-
-                    rel_f = (rel_fg * fwd_unsq).sum(dim=2)
-                    rel_l = (rel_fg * lat_unsq).sum(dim=2)
-                    rel_v = vel_g.unsqueeze(1) - nbr_vel
-                    rel_v_f = (rel_v * fwd_unsq).sum(dim=2)
-
-                    d_norm = torch.clamp(torch.sqrt(rel_f ** 2 + rel_l ** 2) / max_ray_dist, max=1.0)
-                    vf_norm = rel_v_f / 140.0
-
-                    feats = torch.stack([d_norm, rel_f / max_ray_dist, rel_l / max_ray_dist, vf_norm], dim=2)
-                    feats = feats.reshape(g, -1)
-                    neigh_feats = feats
-        else:
-            neigh_feats = torch.zeros((1, K * 4), device=cars.pos.device)
-
-        # Zero-out features corresponding to inactive cars so they don't influence the model
-        if active_mask is not None:
-            if neigh_feats.shape[0] == N:
-                neigh_feats[~active_mask] = 0.0
-            # make ray sensors report 'no nearby obstacles' for inactive cars
-            ray_dists[~active_mask] = 1.0
-            # zero speed and other scalar lookaheads for inactive cars
-            speed_input[~active_mask] = 0.0
-            for i in range(len(curvatures)):
-                curvatures[i][~active_mask] = 0.0
-            for i in range(len(distances)):
-                distances[i][~active_mask] = 0.0
-
-        # ---- Concatenate all features ----
-        feature_list = [
-            ray_dists,  # n_rays features
-            speed_input,
-            neigh_feats
-        ]
-        feature_list.extend(curvatures)  # 6 features (3 gates * 2 for sin/cos)
-        feature_list.extend(distances)   # 3 features (distances to lookahead gate centers)
-
-        inputs = torch.cat(feature_list, dim=1)
-
-        # As a final safeguard, zero full inputs for inactive cars
-        if active_mask is not None and inputs.shape[0] == N:
-            inputs[~active_mask] = 0.0
-        
-        return inputs, ray_dists_original
+    inputs = torch.cat([ray_dists, speed_input, *curvatures, *distances], dim=1)
+    inputs[~cars.active] = 0.0
+    return inputs, ray_dists_original
 
 
 

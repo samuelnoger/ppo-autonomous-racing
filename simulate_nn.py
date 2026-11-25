@@ -1,6 +1,5 @@
 import tkinter as tk
 import torch
-from torch.distributions import Normal
 from model import CarState, CarNet # your trained model classes
 from utils import get_inputs, load_checkpoint_tolerant  # function to compute NN inputs and tolerant loader
 from track import Track  # your Track class
@@ -20,7 +19,7 @@ MAX_RENDER_FPS = 60  # optional cap on rendering speed
 # -----------------------------
 class Simulation:
 
-    def __init__(self, track, model, n_cars=1, n_rays=13, start_idx=0, device="cpu", max_ray_dist=500, steer_smooth_alpha=0.8, steer_noise=0.02, accel_noise=0.05, start_mode=None, group_size=None, car_length=8.0, car_width=4.0, start_spacing=1.5):
+    def __init__(self, track, model, n_cars=1, n_rays=13, start_idx=0, device="cpu", max_ray_dist=500, steer_smooth_alpha=0.8, car_length=8.0, car_width=4.0, start_spacing=1.5):
         self.track = track
         self.model = model.to(device)
         self.n_cars = n_cars
@@ -28,11 +27,7 @@ class Simulation:
         self.device = device
         self.max_ray_dist = max_ray_dist
         self.steer_smooth_alpha = steer_smooth_alpha
-        self.steer_noise = steer_noise
-        self.accel_noise = accel_noise
         self.start_idx = start_idx
-        self.start_mode = start_mode
-        self.group_size = group_size
         self.timestep = 0
         self.epoch = 0
 
@@ -43,6 +38,7 @@ class Simulation:
 
         self.cars = CarState(n_cars, n_rays=n_rays, device=device, car_length=car_length, car_width=car_width, start_spacing=start_spacing)
         self.gates_tensor = self.track.gates.to(self.device)
+        self.gate_centers = (self.gates_tensor[:, 0:2] + self.gates_tensor[:, 2:4]) / 2.0
         self.gate_indices = torch.full((n_cars,), start_idx, dtype=torch.long, device=device)
         self._reset_cars()
 
@@ -82,17 +78,10 @@ class Simulation:
         self.root.mainloop()
 
     def _reset_cars(self):
-        # forward start_mode/group_size to CarState.reset to choose start layout
-        # Force all simulated cars to face forward in the GUI (avoid half-reversed layout)
-        self.cars.reset(self.track, self.start_idx, self.epoch, force_direction=1, start_mode=self.start_mode, group_size=self.group_size)
-        self.gate_indices.fill_(self.start_idx)
-        # For reverse cars, move one step in their direction so they aim at the correct next gate
-        self.gate_indices = (self.gate_indices + self.cars.direction) % self.gates_tensor.shape[0]
-        if hasattr(self.cars, "prev_steer"):
-            self.cars.prev_steer.zero_()
-        # Reset LSTM hidden state when resetting cars
-        if hasattr(self.model, 'init_hidden'):
-            self.hidden = self.model.init_hidden(self.n_cars, self.device)
+        start_indices = self.cars.reset(
+            self.track, start_idx=self.start_idx, random_start=False, force_direction=1
+        )
+        self.gate_indices = (start_indices + self.cars.direction) % self.gates_tensor.shape[0]
 
     def on_restart(self, _event=None):
         self.timestep = 0
@@ -117,10 +106,6 @@ class Simulation:
         return rotated.flatten().tolist()
 
     def update(self, t):
-        now = (
-            self.root.winfo_pointerx()
-        )  # approximate time, we just use fixed step here
-        # advance physics fixed dt
         self.cars.prev_pos = self.cars.pos.clone()
 
         # --- Compute NN inputs ---
@@ -133,40 +118,26 @@ class Simulation:
         )
 
         with torch.no_grad():
-            # Handle LSTM models with hidden state
-            if self.hidden is not None:
-                outputs, self.hidden = self.model(inputs, self.hidden)
-            else:
-                outputs = self.model(inputs)
+            outputs, _ = self.model(inputs)
 
-            # Policy: sample actions from Normal distributions (match Trainer sampling)
-            steer_mean = outputs[:, 0]
-            accel_mean = outputs[:, 1]
-
-            steer_dist = Normal(steer_mean, self.steer_noise)
-            accel_dist = Normal(accel_mean, self.accel_noise)
-
-            steer = torch.clamp(steer_dist.sample(), -1.0, 1.0)
-            accel = torch.clamp(accel_dist.sample(), -1.0, 1.0)
-
-            # Keep a copy of active flags to detect crashes for debug printing
-            prev_active = self.cars.active.clone()
+            active_f = self.cars.active.float()
+            steer = torch.clamp(outputs[:, 0], -1.0, 1.0) * active_f
+            accel = torch.clamp(outputs[:, 1], -1.0, 1.0) * active_f
 
             self.cars.physics_update(steer, accel, dt=PHYSICS_DT, steer_smooth_alpha=self.steer_smooth_alpha)
             self.cars.check_collisions(self.track)
 
-            # Advance gate indices when car is close to the current gate line
-            gate_coords = self.gates_tensor[self.gate_indices]
-            gx1, gy1 = gate_coords[:, 0], gate_coords[:, 1]
-            gx2, gy2 = gate_coords[:, 2], gate_coords[:, 3]
-            line_vec = torch.stack([gx2 - gx1, gy2 - gy1], dim=1)
-            p_vec = self.cars.pos - torch.stack([gx1, gy1], dim=1)
-            line_len2 = (line_vec ** 2).sum(dim=1)
-            u = torch.clamp((p_vec * line_vec).sum(dim=1) / line_len2, 0.0, 1.0)
-            closest = torch.stack([gx1, gy1], dim=1) + u.unsqueeze(1) * line_vec
-            dist_to_gate = (self.cars.pos - closest).norm(dim=1)
-            passed = dist_to_gate < 10.0
-            self.gate_indices[passed] = (self.gate_indices[passed] + self.cars.direction[passed]) % self.gates_tensor.shape[0]
+            # Advance gate indices when car crosses the plane of the next gate
+            n_gates = self.gates_tensor.shape[0]
+            prev_indices = (self.gate_indices - self.cars.direction) % n_gates
+            p_prev = self.gate_centers[prev_indices]
+            p_next = self.gate_centers[self.gate_indices]
+            tangent = p_next - p_prev
+
+            passed = (((self.cars.pos - p_next) * tangent).sum(dim=1) >= 0.0) & self.cars.active
+            self.gate_indices[passed] = (
+                self.gate_indices[passed] + self.cars.direction[passed]
+            ) % n_gates
 
         # Recompute ray end points so drawn rays match current car positions.
         # `ray_dists` returned by get_inputs is the original distances in pixels.
@@ -254,16 +225,7 @@ def main():
     MODEL_NAME = "carnet"
     # Manual override: set to an int to force number of cars here, or None to use CLI/config.
     # Example: set `manual_n_cars = 1` to run a single-car legacy simulation.
-    manual_n_cars = 6
-
-    # If not manually overridden, prefer `args.group_size` to simulate a single training group
-    # (useful when training uses very large batches but we only want one group in the GUI).
-    if manual_n_cars is not None:
-        n_cars = manual_n_cars
-    elif hasattr(args, 'group_size') and args.group_size and args.group_size > 0:
-        n_cars = args.group_size
-    else:
-        n_cars = args.n_cars if hasattr(args, 'n_cars') else 4
+    manual_n_cars = 1
 
     # Load config.json if it exists
     import json, os
@@ -280,6 +242,15 @@ def main():
 
     args = parser.parse_args()
 
+    # If not manually overridden, prefer `args.group_size` to simulate a single training group
+    # (useful when training uses very large batches but we only want one group in the GUI).
+    if manual_n_cars is not None:
+        n_cars = manual_n_cars
+    elif hasattr(args, 'group_size') and args.group_size and args.group_size > 0:
+        n_cars = args.group_size
+    else:
+        n_cars = args.n_cars if hasattr(args, 'n_cars') else 4
+
     device = torch.device("cpu")
 
     # Handle multi-track config - default to simple track for simulation
@@ -287,25 +258,19 @@ def main():
 
     track = Track(track_name, 1000, 600, device=device, ray_method=args.ray_method)
 
-    # Determine checkpoint path to load:
-    # Priority: config['resume_checkpoint'] -> args.resume_checkpoint -> args.checkpoint (if full .pth) -> per-track last.pth under args.checkpoint/base
-    if config and config.get('resume_checkpoint'):
-        checkpoint_path = config.get('resume_checkpoint')
-    elif getattr(args, 'resume_checkpoint', None):
-        checkpoint_path = args.resume_checkpoint
-    elif getattr(args, 'checkpoint', None) and str(args.checkpoint).endswith('.pth'):
-        checkpoint_path = args.checkpoint
+    if getattr(args, "load", ""):
+        checkpoint_path = args.load
+    elif getattr(args, "save", ""):
+        checkpoint_path = args.save
     else:
-        base_dir = args.checkpoint if getattr(args, 'checkpoint', None) else 'checkpoints'
-        checkpoint_path = os.path.join(base_dir, track_name, 'last.pth')
+        checkpoint_path = "checkpoints/base.pth"
 
     print(f"Using model: {MODEL_NAME}")
     print(f"Loading checkpoint from: {checkpoint_path}")
 
-    # Compute input dim to match `get_inputs` composition: rays + speed(1) + neighbor(K*4) + curvatures(6) + distances(3)
-    K = 3
-    computed_input_dim = args.n_rays + 1 + (K * 4) + 6 + 3
-    print(f"Computed input_dim={computed_input_dim} (n_rays={args.n_rays}, K={K})")
+    # rays + speed(1) + curvatures(6) + distances(3)
+    computed_input_dim = args.n_rays + 10
+    print(f"Computed input_dim={computed_input_dim} (n_rays={args.n_rays})")
 
     # carnet, separate_heads, deep, attention
     model = CarNet(
@@ -339,10 +304,6 @@ def main():
         device=device,
         max_ray_dist=args.max_ray_dist,
         steer_smooth_alpha=args.steer_smooth_alpha,
-        steer_noise=args.steer_noise,
-        accel_noise=args.accel_noise,
-        start_mode=sim_start_mode,
-        group_size=sim_group_size,
         car_length=args.car_length,
         car_width=args.car_width,
         start_spacing=args.start_spacing,

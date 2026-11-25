@@ -1,171 +1,71 @@
-# Autonomous-Navigation
+# ppo-autonomous-racing
 
-This is a PyTorch-based racing project where a neural network learns to drive a car around 2D tracks using ray-based observations, continuous steering, and acceleration control.
-
-## Overview
-
-The project contains:
-- a training pipeline for learning driving behavior on one or more tracks
-- a Tkinter simulation viewer for running trained models or random policies
-- several model variants, including recurrent and attention-based architectures
-- track generation and loading for both built-in layouts and GeoJSON tracks
-- live reward plotting during training
+A PyTorch reinforcement learning project where an Actor-Critic agent learns to drive around 2D race tracks using vectorized kinematics, ray-cast perception, and Proximal Policy Optimization (PPO).
 
 ## Features
 
-- Continuous control for steering and acceleration
-- Ray-cast track perception
-- Multiple track layouts, including built-in and GeoJSON-based tracks
-- Sequential training across multiple tracks
-- Per-track checkpoints and resume support
-- Real-time simulation with Tkinter
-- Live reward plot in a separate process
+- **Vectorized 2D Physics:** Batched PyTorch car dynamics (`CarState`) featuring Ackermann steering, speed-dependent grip/drift hysteresis, and wall-drag collision handling.
+- **PPO Multi-Track Training:** Mixes rollouts from multiple tracks into every PPO update (with GAE and `CosineAnnealingLR`) so the policy generalizes across wide sweepers and tight hairpins without forgetting.
+- **Ray-Cast Perception:** 1D CNN encoder over distance rays combined with speed and upcoming track curvature/lookahead features.
+- **Real-Time Viewer:** Tkinter simulation (`simulation.py`) that loads `config.json` and trained checkpoints for zero-noise evaluation.
+- **Built-in & Custom Tracks:** Supports built-in layouts (`simple`, `square`, `triangle`, `square_narrow`, `us_track`, `redbull_ring`) as well as custom GeoJSON tracks.
 
-## Requirements
+## Installation
 
-The project uses:
-- Python 3.11+
-- PyTorch
-- NumPy
-- Matplotlib
-- OpenCV
-- GeoPandas
-- Tkinter
-
-A typical install looks like:
+Requires Python 3.11+ and Tkinter.
 
 ```bash
-pip install torch numpy matplotlib opencv-python geopandas
-```
+pip install torch numpy matplotlib opencv-python geopandas tqdm
 
-If you already have a working virtual environment, activate it before running training or simulation.
+```
 
 ## Quick Start
 
 ### 1. Train a model
 
-Use the shell script for the default training setup:
+Train across multiple tracks simultaneously (CPU is recommended, as vectorized rollouts avoid GPU/MPS sync overhead):
 
 ```bash
-./train_nn.sh
+python -m train.train_rl \
+  --tracks square triangle square_narrow \
+  --n_epochs 150 \
+  --n_steps 400 \
+  --n_cars 128 \
+  --device cpu \
+  --save checkpoints/base.pth
+
 ```
 
-Or run the trainer directly:
+Training automatically saves `config.json`, periodic checkpoints (`checkpoints/base.pth`), the best all-around model (`checkpoints/base_best.pth`), and a reward curve (`reward_plot.png`).
+
+To resume or fine-tune from an existing checkpoint:
 
 ```bash
-python3 -m train.train_nn \
-  --track triangle \
-  --n_epochs 300 \
-  --n_steps 1600 \
-  --n_cars 512
+python -m train.train \
+  --load checkpoints/base_best.pth \
+  --tracks square triangle square_narrow \
+  --n_epochs 100 \
+  --lr 1e-4
+
 ```
 
-### 2. Watch a simulation
-
-Run the Tkinter viewer with a random policy:
+### 2. Run the simulation
 
 ```bash
-python simulate_nn.py
+python simulation.py
+
 ```
 
-Load a trained checkpoint:
+Update the checkpoint path or track inside `simulate_nn.py` (or pass `--track <name>`) to test different models and layouts.
 
-```bash
-python simulate_nn.py
-```
+## Architecture
 
-The simulation script currently loads `checkpoints/us_track/last.pth` by default in its example configuration, so update the path in `simulate_nn.py` if you want to visualize another checkpoint.
+`CarNet` (`model/model_CarNet.py`) is an Actor-Critic network:
 
-## Training
-
-### Main trainer
-
-The core training entry point is:
-
-```bash
-python -m train.train_nn
-```
-
-### Training script
-
-`train_nn.sh` is a convenience wrapper around the Python trainer. It sets a default training configuration and can be edited at the top for your preferred:
-- number of cars
-- number of epochs
-- learning rate
-- track sequence
-- checkpoint paths
-
-### Checkpoints
-
-Training saves checkpoints per track under:
-
-```text
-checkpoints/<track_name>/last.pth
-```
-
-If you pass a direct `.pth` file to `--checkpoint`, the trainer uses that exact file.
-If you pass a directory, it saves into `<directory>/<track_name>/last.pth`.
-
-## Simulation
-
-The Tkinter viewer is in `simulate_nn.py`.
-
-It:
-- loads a trained `CarNet` checkpoint
-- builds the selected track
-- runs the simulation with a GUI canvas
-- uses the same input preprocessing as training
-
-### Example usages
-
-Random policy:
-
-```bash
-python3 simulate_nn.py
-```
-
-Use a custom track from the command line arguments:
-
-```bash
-python simulate_nn.py --config --track triangle
-```
-
-## Tracks
-
-Supported named tracks include:
-- `simple`
-- `square`
-- `triangle`
-- `square_narrow`
-- `us_track`
-- `redbull_ring`
-
-You can also load an absolute path to a GeoJSON track file.
-
-## Models
-
-The default network is `CarNet`, which uses:
-- a 1D convolutional encoder for ray inputs
-- a small MLP for state features
-- a final control head that outputs steering and acceleration
-
-Additional architectures are available in `model/model_variants.py`:
-- `LSTMCarNet`
-- `GRUCarNet`
-- `SeparateHeadsCarNet`
-- `DeepCarNet`
-- `AttentionCarNet`
-
-## Tips
-
-- Start with a simple track like `simple` or `triangle` when debugging training.
-- If training is unstable, lower the learning rate or try the recurrent variants.
-- If simulation fails to open, verify that Tkinter is available in your Python install.
-- For custom GeoJSON tracks, make sure the file is readable from the path you pass in.
+* **Ray encoder:** 2-layer 1D CNN over normalized wall-distance rays.
+* **State encoder:** MLP over normalized speed, upcoming curvatures, and lookahead distances.
+* **Heads:** Shared MLP trunk feeding a continuous Gaussian policy (`steering`, `accel` in `[-1, 1]` with learnable `log_std`) and a scalar value head `V(s)`.
 
 ## Development Methodology
-The core neural network architectures and boilerplate PyTorch code for this project were scaffolded with the assistance of AI coding tools. My primary technical contributions focus on the conceptual design, physics engine integration, hyperparameter tuning, and orchestrating the end-to-end training pipelines on Apple Silicon/MPS.
 
-## Notes
-
-This README is intentionally focused on the current code in this workspace. If you change the training script or checkpoint layout later, update the examples here as well.
+Core PyTorch boilerplate and network scaffolding were developed with the assistance of AI coding tools. My primary contributions focus on the conceptual design, 2D physics and drift modeling, reward/PPO tuning, and end-to-end training and evaluation workflows.
