@@ -26,7 +26,7 @@ pip install torch numpy matplotlib opencv-python geopandas tqdm
 Train across multiple tracks simultaneously (CPU is recommended, as vectorized rollouts avoid GPU/MPS sync overhead):
 
 ```bash
-python -m train.train_rl \
+python -m train.train \
   --tracks square triangle square_narrow \
   --n_epochs 150 \
   --n_steps 400 \
