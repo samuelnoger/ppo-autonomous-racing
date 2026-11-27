@@ -1,5 +1,6 @@
 import atexit
 import multiprocessing as mp
+import sys
 from collections import deque
 
 
@@ -39,8 +40,8 @@ def _plot_worker(recv_conn, max_points=1000, update_interval_ms=250):
             if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "__save__":
                 try:
                     fig.savefig(msg[1])
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"Warning: failed to save reward plot: {e}", file=sys.stderr)
                 continue
             # Message formats supported:
             # (epoch, reward) or (epoch, raw_reward, norm_reward)
@@ -51,12 +52,7 @@ def _plot_worker(recv_conn, max_points=1000, update_interval_ms=250):
                 epoch, raw_reward, norm_reward = msg[0], msg[1], msg[2]
                 reward = norm_reward
             else:
-                # Fallback: unexpected format
-                try:
-                    epoch, reward = msg
-                    norm_reward = None
-                except Exception:
-                    continue
+                epoch, reward = msg
             epochs.append(epoch)
             rewards.append(reward)
 
@@ -93,7 +89,6 @@ def _plot_worker(recv_conn, max_points=1000, update_interval_ms=250):
         fig._reward_animation = ani
     except (AttributeError, RuntimeError) as e:
         # FuncAnimation failed (common on macOS TkAgg). Fall back to periodic manual updates.
-        import sys
         print(f"Warning: FuncAnimation setup failed ({e}). Using manual updates instead.", file=sys.stderr)
         def manual_update():
             while recv_conn.poll():
@@ -105,8 +100,8 @@ def _plot_worker(recv_conn, max_points=1000, update_interval_ms=250):
                 if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "__save__":
                     try:
                         fig.savefig(msg[1])
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"Warning: failed to save reward plot: {e}", file=sys.stderr)
                     continue
                 # Message formats supported: (epoch, reward) or (epoch, raw, norm)
                 if isinstance(msg, tuple) and len(msg) == 2:
@@ -114,10 +109,7 @@ def _plot_worker(recv_conn, max_points=1000, update_interval_ms=250):
                 elif isinstance(msg, tuple) and len(msg) >= 3:
                     epoch, raw_reward, reward = msg[0], msg[1], msg[2]
                 else:
-                    try:
-                        epoch, reward = msg
-                    except Exception:
-                        continue
+                    epoch, reward = msg
                 epochs.append(epoch)
                 rewards.append(reward)
 

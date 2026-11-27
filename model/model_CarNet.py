@@ -98,27 +98,29 @@ class CarState:
         # Driving direction per car: 1 for forward, -1 for reverse
         self.direction = torch.ones(n_cars, dtype=torch.int64, device=device)
 
+        # Physical properties
         self.max_speed = 80.0
-        self.accel_rate = 7.5
+        self.accel_rate = 10.0
         self.breaking_rate = 20.0
         self.friction = 0.025
-        self.drift_factor = 3.0  # Velocity lag: 0 = instant, 1 = no effect
-        self.wheelbase = 7.5
+        self.drift_factor = 1.0
+        self.wheelbase = 6.0
         self.max_steering_angle = math.pi / 4
-        self.max_grip_accel = 35.0
+        self.max_grip_accel = 25.0
         self.max_steering_rate = 1.0  
         self.enter_threshold = 1.0
         self.exit_threshold = 0.5
         self.enter_threshold = 1.0
-        self.exit_threshold = 0.5
+        self.exit_threshold = 0.25
         self.wall_drag = 0.75
+
         # grouping id for batch-local interactions. Default single group 0
         self.batch = torch.zeros(n_cars, dtype=torch.long, device=device)
         # Physical dimensions (pixels)
         self.car_length = float(car_length)
         self.car_width = float(car_width)
         # Radius used for circle-approx collision tests
-        self.car_radius = float(max(self.car_length, self.car_width) * 0.5)
+        self.car_radius = float(self.car_width * 0.5)
         # Start spacing multiplier (longitudinal spacing = car_length * start_spacing)
         self.start_spacing = float(start_spacing)
         # Number of columns is fixed to two for F1-style starts
@@ -223,11 +225,7 @@ class CarState:
         # SPEED: Acceleration + friction
         # ============================================================================
         # apply slowdown to requested acceleration when in contact
-        if hasattr(self, 'contact_slowdown'):
-            try:
-                accel = accel * self.contact_slowdown
-            except Exception:
-                pass
+        accel = accel * self.contact_slowdown
 
         accel_mask = (accel >= 0) | (self.speed <= 0)
         brake_mask = (accel < 0) & (self.speed > 0)
@@ -269,7 +267,7 @@ class CarState:
 
         # Speed loss from drifting (lateral friction during oversteer)
         slip_excess = (slip_ratio - 1.0).clamp(min=0.0)
-        drift_friction_factor = 5  # Tunable: higher = more speed loss while drifting
+        drift_friction_factor = 2  # Tunable: higher = more speed loss while drifting
         self.speed[slip_mask] = self.speed[slip_mask] * (1.0 - slip_excess[slip_mask] * drift_friction_factor * dt)
 
         # Recompute ideal velocity with the new (lower) speed from drift friction
@@ -331,24 +329,14 @@ class CarState:
         if active_idx_all.numel() > 0:
             pos_active = self.pos[active_idx_all]
 
-            # try bilinear sampling; fallback to nearest lookup
-            try:
-                dist = track._sample_distance_field_bilinear(pos_active)
-            except Exception:
-                px = pos_active[:, 0].long().clamp(0, track.w - 1)
-                py = pos_active[:, 1].long().clamp(0, track.h - 1)
-                dist = track.distance_field[py, px]
-
+            dist = track._sample_distance_field_bilinear(pos_active)
             dist = dist.to(self.pos.device)
 
             penetrating = dist < self.car_radius
 
             # reset recorded impacts for this step
-            try:
-                self.last_impacts.zero_()
-                self.contact_slowdown.fill_(1.0)
-            except Exception:
-                pass
+            self.last_impacts.zero_()
+            self.contact_slowdown.fill_(1.0)
 
             if penetrating.any():
                 idx_pen = active_idx_all[penetrating]
@@ -362,22 +350,10 @@ class CarState:
                 offs_yp = pos_pen + torch.tensor([0.0, eps], device=pos_pen.device)
                 offs_ym = pos_pen + torch.tensor([0.0, -eps], device=pos_pen.device)
 
-                try:
-                    d_xp = track._sample_distance_field_bilinear(offs_xp)
-                    d_xm = track._sample_distance_field_bilinear(offs_xm)
-                    d_yp = track._sample_distance_field_bilinear(offs_yp)
-                    d_ym = track._sample_distance_field_bilinear(offs_ym)
-                except Exception:
-                    # nearest lookup fallback
-                    def _nns(p):
-                        px = p[:, 0].long().clamp(0, track.w - 1)
-                        py = p[:, 1].long().clamp(0, track.h - 1)
-                        return track.distance_field[py, px]
-
-                    d_xp = _nns(offs_xp)
-                    d_xm = _nns(offs_xm)
-                    d_yp = _nns(offs_yp)
-                    d_ym = _nns(offs_ym)
+                d_xp = track._sample_distance_field_bilinear(offs_xp)
+                d_xm = track._sample_distance_field_bilinear(offs_xm)
+                d_yp = track._sample_distance_field_bilinear(offs_yp)
+                d_ym = track._sample_distance_field_bilinear(offs_ym)
 
                 grad_x = (d_xp - d_xm) / (2.0 * eps)
                 grad_y = (d_yp - d_ym) / (2.0 * eps)

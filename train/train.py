@@ -169,10 +169,7 @@ def main():
                 print(f"Saved reward plot to {save_path}")
             except Exception as e:
                 print(f"Warning: failed to save reward plot: {e}")
-        try:
-            trainer.plotter.close()
-        except Exception:
-            pass
+        trainer.plotter.close()
 
 
 if __name__ == "__main__":

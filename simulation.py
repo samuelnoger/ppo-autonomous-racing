@@ -31,6 +31,12 @@ class Simulation:
         self.timestep = 0
         self.epoch = 0
 
+        self.disp_steer = 0.0
+        self.disp_accel = 0.0
+        self.disp_speed = 0.0
+        self.hud_frame = 0
+        self.hud_text = ("Steer: +0.00", "Accel: +0.00", "Speed: +0.0 px/s")
+
         # Initialize LSTM hidden state if using LSTM model
         self.hidden = None
         if hasattr(self.model, 'init_hidden'):
@@ -141,26 +147,18 @@ class Simulation:
 
         # Recompute ray end points so drawn rays match current car positions.
         # `ray_dists` returned by get_inputs is the original distances in pixels.
-        try:
-            ray_angles = self.cars.ray_angles  # [n_cars, n_rays]
-            ray_lengths = ray_dists  # already in pixels from get_inputs
-            dx = torch.cos(ray_angles) * ray_lengths  # [n_cars, n_rays]
-            dy = torch.sin(ray_angles) * ray_lengths
-            ray_ends = self.cars.pos.unsqueeze(1) + torch.stack([dx, dy], dim=2)
-        except Exception:
-            ray_ends = None
+        ray_angles = self.cars.ray_angles  # [n_cars, n_rays]
+        ray_lengths = ray_dists  # already in pixels from get_inputs
+        dx = torch.cos(ray_angles) * ray_lengths  # [n_cars, n_rays]
+        dy = torch.sin(ray_angles) * ray_lengths
+        ray_ends = self.cars.pos.unsqueeze(1) + torch.stack([dx, dy], dim=2)
 
         # --- Draw cars ---
         for i in range(self.n_cars):
             # Skip drawing inactive cars to avoid visual clutter; they also no longer
             # influence active cars due to input masking in get_inputs.
             if hasattr(self.cars, 'active') and not bool(self.cars.active[i].item()):
-                # hide the polygon
-                try:
-                    self.canvas.itemconfig(self.car_rects[i], state='hidden')
-                except Exception:
-                    pass
-                continue
+                self.canvas.itemconfig(self.car_rects[i], state='hidden')
 
             pos = self.cars.pos[i].cpu()
             angle = self.cars.angle[i].cpu()
@@ -169,18 +167,18 @@ class Simulation:
             color = "red" if self.cars.active[i] else "gray"
             self.canvas.itemconfig(self.car_rects[i], fill=color, state='normal')
         # Draw rays (delete previous ray lines then draw new ones)
-        self.canvas.delete("ray")
-        if ray_ends is not None:
-            for i in range(self.n_cars):
-                if hasattr(self.cars, 'active') and not bool(self.cars.active[i].item()):
-                    continue
-                start = self.cars.pos[i].cpu().numpy()
-                for j in range(ray_ends.shape[1]):
-                    if j == self.n_rays // 2:
-                        end = ray_ends[i, j].cpu().numpy()
-                        x0, y0 = float(start[0]), float(start[1])
-                        x1, y1 = float(end[0]), float(end[1])
-                        self.canvas.create_line(x0, y0, x1, y1, fill="orange", width=1, tags="ray")
+        #elf.canvas.delete("ray")
+        #f ray_ends is not None:
+        #   for i in range(self.n_cars):
+        #       if hasattr(self.cars, 'active') and not bool(self.cars.active[i].item()):
+        #           continue
+        #       start = self.cars.pos[i].cpu().numpy()
+        #       for j in range(ray_ends.shape[1]):
+        #           if j == self.n_rays // 2:
+        #               end = ray_ends[i, j].cpu().numpy()
+        #               x0, y0 = float(start[0]), float(start[1])
+        #               x1, y1 = float(end[0]), float(end[1])
+        #               self.canvas.create_line(x0, y0, x1, y1, fill="orange", width=1, tags="ray")
 
         self.canvas.delete("text")
         self.canvas.create_text(
@@ -193,24 +191,24 @@ class Simulation:
             self.canvas.itemconfig(line_obj, fill=color)
 
         if self.n_cars == 1:
-            steer_val = steer[0].item()
-            accel_val = accel[0].item()
-            speed_val = self.cars.speed[0].item()
-            self.canvas.create_text(
-                10, 80, anchor="w",
-                text=f"Steer: {steer_val:+.2f}",
-                fill="blue", font=("Courier", 12), tags="text"
-            )
-            self.canvas.create_text(
-                10, 100, anchor="w",
-                text=f"Accel: {accel_val:+.2f}",
-                fill="blue", font=("Courier", 12), tags="text"
-            )
-            self.canvas.create_text(
-                10, 120, anchor="w",
-                text=f"Speed: {speed_val:+.1f} px/s",
-                fill="blue", font=("Courier", 12), tags="text"
-            )
+            alpha = 0.2  # lower = smoother, higher = more responsive
+            self.disp_steer += alpha * (steer[0].item() - self.disp_steer)
+            self.disp_accel += alpha * (accel[0].item() - self.disp_accel)
+            self.disp_speed += alpha * (self.cars.speed[0].item() - self.disp_speed)
+
+            self.hud_frame += 1
+            if self.hud_frame % 6 == 0:  # refresh text ~5-10 times/sec
+                self.hud_text = (
+                    f"Steer: {self.disp_steer:+.2f}",
+                    f"Accel: {self.disp_accel:+.2f}",
+                    f"Speed: {self.disp_speed:5.1f} px/s",
+                )
+
+            for i, line in enumerate(self.hud_text):
+                self.canvas.create_text(
+                    10, 80 + i * 20, anchor="w",
+                    text=line, fill="blue", font=("Courier", 12), tags="text"
+                )
 
         self.timestep += 1
         # schedule next update
@@ -263,7 +261,7 @@ def main():
     elif getattr(args, "save", ""):
         checkpoint_path = args.save
     else:
-        checkpoint_path = "checkpoints/base.pth"
+        checkpoint_path = "checkpoints/real_tracks_best.pth"
 
     print(f"Using model: {MODEL_NAME}")
     print(f"Loading checkpoint from: {checkpoint_path}")
