@@ -5,3 +5,4 @@ checkpoints/
 config.json
 reward_plot.png
 test_draw.py
+.DS_Store
